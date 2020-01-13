@@ -12,6 +12,7 @@ WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."""
 import os
+import traceback
 from OpenGL import GL
 
 from collections import defaultdict
@@ -31,6 +32,7 @@ import pymclevel
 from pymclevel.box import Vector, BoundingBox, FloatBox
 from fill import  BlockFillOperation
 import tempfile
+from pymclevel import nbt
 
 SelectSettings = config.Settings("Selection")
 SelectSettings.showPreviousSelection = SelectSettings("Show Previous Selection", True)
@@ -281,8 +283,13 @@ class SelectionTool(EditorTool):
                 text += "{id}: {pos}\n".format(id=t["id"].value, pos=[t[a].value for a in "xyz"])
             except Exception, e:
                 text += repr(e)
-            if "Items" not in t:
-                text += str(t)
+            if "Items" in t and not pygame.key.get_mods() & pygame.KMOD_ALT:
+                text += "--Items omitted. ALT to view. Double-click to edit.--\n"
+                t = nbt.TAG_Compound(list(t.value))
+                del t["Items"]
+
+            text += str(t)
+
         return text
 
     @property
@@ -401,7 +408,6 @@ class SelectionTool(EditorTool):
             dir = dir * (16, 16, 16)
         op = NudgeBlocksOperation(self.editor, self.editor.level, self.selectionBox(), dir)
 
-        self.performWithRetry(op)
         self.editor.addOperation(op)
         self.editor.addUnsavedEdit()
 
@@ -416,8 +422,7 @@ class SelectionTool(EditorTool):
             return
 
         op = NudgeSelectionOperation(self, dir)
-        self.performWithRetry(op)
-        # self.editor.addOperation(op)
+        self.editor.addOperation(op)
 
     def nudgePoint(self, p, n):
         if self.selectionBox() is None:
@@ -608,7 +613,6 @@ class SelectionTool(EditorTool):
                 o, m = self.selectionPointsFromDragResize()
 
                 op = SelectionOperation(self, (o, m))
-                self.performWithRetry(op)
                 self.editor.addOperation(op)
 
             self.dragResizeFace = None
@@ -622,11 +626,11 @@ class SelectionTool(EditorTool):
 
         if self.dragStartPoint != pos or self.clickSelectionInProgress:
             op = SelectionOperation(self, (self.dragStartPoint, pos))
-            self.performWithRetry(op)
             self.editor.addOperation(op)
             self.selectionInProgress = False
             self.currentCorner = 1
             self.clickSelectionInProgress = False
+            self.dragStartPoint = None
 
         else:
             points = self.getSelectionPoints()
@@ -634,12 +638,10 @@ class SelectionTool(EditorTool):
                 points = (pos, pos)  # set both points on the first click
             else:
                 points[self.currentCorner] = pos
-
             if not self.clickSelectionInProgress:
                 self.clickSelectionInProgress = True
             else:
                 op = SelectionOperation(self, points)
-                self.performWithRetry(op)
                 self.editor.addOperation(op)
 
                 self.selectOtherCorner()
@@ -756,7 +758,7 @@ class SelectionTool(EditorTool):
                         bt = self.editor.level.blockAt(sx, sy, sz)
                         if(bt):
                             alpha = 0.2
-                    except pymclevel.ChunkNotPresent:
+                    except (EnvironmentError, pymclevel.ChunkNotPresent):
                         pass
 
                     GL.glLineWidth(lineWidth)
@@ -870,8 +872,6 @@ class SelectionTool(EditorTool):
                     GL.glDisable(GL.GL_BLEND)
                     GL.glDisable(GL.GL_DEPTH_TEST)
 
-        pos, direction = self.editor.blockFaceUnderCursor
-        x, y, z = pos
         selectionColor = map(lambda a: a * a * a * a, self.selectionColor)
 
         # draw a colored box representing the possible selection
@@ -882,12 +882,14 @@ class SelectionTool(EditorTool):
         if ((self.selectionInProgress or self.clickSelectionInProgress) and otherCorner != None):
             GL.glPolygonOffset(DepthOffset.PotentialSelection, DepthOffset.PotentialSelection)
 
-            box = self.selectionBoxForCorners(otherCorner, pos)
-            if self.chunkMode:
-                box = box.chunkBox(self.editor.level)
-                if pygame.key.get_mods() & pygame.KMOD_ALT:
-                    selectionColor = [1., 0., 0.]
-            self.editor.drawConstructionCube(box, selectionColor + [self.alpha, ])
+            pos, direction = self.editor.blockFaceUnderCursor
+            if pos is not None:
+                box = self.selectionBoxForCorners(otherCorner, pos)
+                if self.chunkMode:
+                    box = box.chunkBox(self.editor.level)
+                    if pygame.key.get_mods() & pygame.KMOD_ALT:
+                        selectionColor = [1., 0., 0.]
+                self.editor.drawConstructionCube(box, selectionColor + [self.alpha, ])
         else:
             # don't draw anything at the mouse cursor if we're resizing the box
             if self.dragResizeFace is None:
@@ -913,7 +915,7 @@ class SelectionTool(EditorTool):
             if(bt):
 ##                textureCoords = materials[bt][0]
                 alpha = 0.12
-        except pymclevel.ChunkNotPresent:
+        except (EnvironmentError, pymclevel.ChunkNotPresent):
             pass
 
         # cube sides
@@ -947,12 +949,10 @@ class SelectionTool(EditorTool):
     def selectAll(self):
         box = self.editor.level.bounds
         op = SelectionOperation(self, self.selectionPointsFromBox(box))
-        self.performWithRetry(op)
         self.editor.addOperation(op)
 
     def deselect(self):
         op = SelectionOperation(self, None)
-        self.performWithRetry(op)
         self.editor.addOperation(op)
 
     def setSelectionPoint(self, pointNumber, newPoint):
@@ -996,14 +996,13 @@ class SelectionTool(EditorTool):
         else:
             self._deleteBlocks()
 
-    def _deleteBlocks(self, recordUndo=True):
+    def _deleteBlocks(self):
         box = self.selectionBox()
         if None is box:
             return
         op = BlockFillOperation(self.editor, self.editor.level, box, self.editor.level.materials.Air, [])
         with setWindowCaption("DELETING - "):
             self.editor.freezeStatus("Deleting {0} blocks".format(box.volume))
-            self.performWithRetry(op, recordUndo)
 
             self.editor.addOperation(op)
             self.editor.invalidateBox(box)
@@ -1030,7 +1029,6 @@ class SelectionTool(EditorTool):
                     editor.renderer.invalidateEntitiesInBox(box)
 
             op = DeleteEntitiesOperation(self.editor, self.editor.level)
-            self.performWithRetry(op, recordUndo)
             if recordUndo:
                 self.editor.addOperation(op)
             self.editor.addUnsavedEdit()

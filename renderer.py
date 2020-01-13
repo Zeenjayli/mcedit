@@ -331,6 +331,17 @@ class ChunkCalculator (object):
         def release(self):
             pass
 
+    class renderstateVines(object):
+        @classmethod
+        def bind(self):
+            GL.glDisable(GL.GL_CULL_FACE)
+            GL.glEnable(GL.GL_ALPHA_TEST)
+
+        @classmethod
+        def release(self):
+            GL.glEnable(GL.GL_CULL_FACE)
+            GL.glDisable(GL.GL_ALPHA_TEST)
+
     class renderstateLowDetail(object):
         @classmethod
         def bind(self):
@@ -383,6 +394,7 @@ class ChunkCalculator (object):
 
     renderstates = (
         renderstatePlain,
+        renderstateVines,
         renderstateLowDetail,
         renderstateAlphaTest,
         renderstateIce,
@@ -408,6 +420,7 @@ class ChunkCalculator (object):
                 IceBlockRenderer,
                 FeatureBlockRenderer,
                 StairBlockRenderer,
+                VineBlockRenderer,
             # button, floor plate, door -> 1-cube features
             # lever, sign, wall sign, stairs -> 2-cube features
 
@@ -419,7 +432,7 @@ class ChunkCalculator (object):
             # portal
             ]
 
-        self.materialMap = materialMap = numpy.zeros((256,), 'uint8')
+        self.materialMap = materialMap = numpy.zeros((pymclevel.materials.id_limit,), 'uint8')
         materialMap[1:] = 1  # generic blocks
 
         materialCount = 2
@@ -440,18 +453,22 @@ class ChunkCalculator (object):
             pymclevel.materials.alphaMaterials.MonsterSpawner,
             pymclevel.materials.alphaMaterials.Vines,
             pymclevel.materials.alphaMaterials.Fire,
+            pymclevel.materials.alphaMaterials.Trapdoor,
+            pymclevel.materials.alphaMaterials.Lever,
+            pymclevel.materials.alphaMaterials.BrewingStand,
+
         ]
         for b in transparentMaterials:
             mats[b.ID] = materialCount
             materialCount += 1
 
-    hiddenOreMaterials = numpy.arange(256, dtype='uint8')
+    hiddenOreMaterials = numpy.arange(pymclevel.materials.id_limit, dtype='uint8')
     hiddenOreMaterials[2] = 1  # don't show boundaries between dirt,grass,sand,gravel,stone
     hiddenOreMaterials[3] = 1
     hiddenOreMaterials[12] = 1
     hiddenOreMaterials[13] = 1
 
-    roughMaterials = numpy.ones((256,), dtype='uint8')
+    roughMaterials = numpy.ones((pymclevel.materials.id_limit,), dtype='uint8')
     roughMaterials[0] = 0
     addTransparentMaterials(None, roughMaterials, 2)
 
@@ -535,14 +552,14 @@ class ChunkCalculator (object):
                 #    raise StopIteration
                 try:
                     neighboringChunks[dir] = level.getChunk(cx + dx, cz + dz)
-                except (pymclevel.mclevelbase.ChunkNotPresent, pymclevel.mclevelbase.ChunkMalformed):
+                except (EnvironmentError, pymclevel.mclevelbase.ChunkNotPresent, pymclevel.mclevelbase.ChunkMalformed):
                     neighboringChunks[dir] = pymclevel.infiniteworld.ZeroChunk(level.Height)
         return neighboringChunks
 
     def getAreaBlocks(self, chunk, neighboringChunks):
         chunkWidth, chunkLength, chunkHeight = chunk.Blocks.shape
 
-        areaBlocks = numpy.zeros((chunkWidth + 2, chunkLength + 2, chunkHeight + 2), numpy.uint8)
+        areaBlocks = numpy.zeros((chunkWidth + 2, chunkLength + 2, chunkHeight + 2), numpy.uint16)
         areaBlocks[1:-1, 1:-1, 1:-1] = chunk.Blocks
         areaBlocks[:1, 1:-1, 1:-1] = neighboringChunks[pymclevel.faces.FaceXDecreasing].Blocks[-1:, :chunkLength, :chunkHeight]
         areaBlocks[-1:, 1:-1, 1:-1] = neighboringChunks[pymclevel.faces.FaceXIncreasing].Blocks[:1, :chunkLength, :chunkHeight]
@@ -935,7 +952,7 @@ class TileTicksRenderer(EntityRendererGeneric):
     layer = Layer.TileTicks
 
     def makeChunkVertices(self, chunk):
-        if "Level" in chunk.root_tag and "TileTicks" in chunk.root_tag["Level"]:
+        if chunk.root_tag and "Level" in chunk.root_tag and "TileTicks" in chunk.root_tag["Level"]:
             ticks = chunk.root_tag["Level"]["TileTicks"]
             if len(ticks):
                 self.vertexArrays.append(self._computeVertices([[t[i].value for i in "xyz"] for t in ticks],
@@ -1030,6 +1047,10 @@ class LowDetailBlockRenderer(BlockRenderer):
         GL.glDisableClientState(GL.GL_TEXTURE_COORD_ARRAY)
         GL.glDrawArrays(GL.GL_QUADS, 0, len(buf) * 4)
         GL.glEnableClientState(GL.GL_TEXTURE_COORD_ARRAY)
+
+    def setAlpha(self, alpha):
+        for va in self.vertexArrays:
+            va.view('uint8')[..., -1] = alpha
 
     def makeChunkVertices(self, ch):
         step = 1
@@ -1309,7 +1330,7 @@ class PlantBlockRenderer(BlockRenderer):
 
             vertexArray[_ST] += texes[:, numpy.newaxis, 0:2]
 
-            vertexArray.view('uint8')[_RGBA] = 0xf  # ignore precomputed directional light
+            vertexArray.view('uint8')[_RGB] = 0xf  # ignore precomputed directional light
             vertexArray.view('uint8')[_RGB] *= lights
             if colorize is not None:
                 vertexArray.view('uint8')[_RGB][colorize] *= LeafBlockRenderer.leafColor
@@ -1776,8 +1797,8 @@ class FeatureBlockRenderer(BlockRenderer):
         vertexArray[..., 0:5] += self.fenceTemplates[..., 0:5]
         vertexArray[_ST] += pymclevel.materials.alphaMaterials.blockTextures[pymclevel.materials.alphaMaterials.WoodPlanks.ID, 0, 0]
 
-        vertexArray.view('uint8')[_RGBA] = self.fenceTemplates[..., 5][..., numpy.newaxis]
-
+        vertexArray.view('uint8')[_RGB] = self.fenceTemplates[..., 5][..., numpy.newaxis]
+        vertexArray.view('uint8')[_A] = 0xFF
         vertexArray.view('uint8')[_RGB] *= areaBlockLights[1:-1, 1:-1, 1:-1][fenceIndices][..., numpy.newaxis, numpy.newaxis, numpy.newaxis]
         vertexArray.shape = (vertexArray.shape[0] * 6, 4, 6)
         yield
@@ -1814,7 +1835,9 @@ class StairBlockRenderer(BlockRenderer):
         materialIndices = self.getMaterialIndices(blockMaterials)
         yield
         stairBlocks = blocks[materialIndices]
-        stairData = blockData[materialIndices] & 0x3
+        stairData = blockData[materialIndices]
+        stairTop = (stairData >> 2).astype(bool)
+        stairData &= 3
 
         blockLight = areaBlockLights[1:-1, 1:-1, 1:-1]
         x, z, y = materialIndices.nonzero()
@@ -1826,7 +1849,7 @@ class StairBlockRenderer(BlockRenderer):
 
             if _ == "step":
                 vertexArray[_XYZST] += self.stairTemplates[4][..., :5]
-
+                vertexArray[_XYZ][..., 1][stairTop] += 0.5
             else:
                 vertexArray[_XYZST] += self.stairTemplates[stairData][..., :5]
 
@@ -1843,10 +1866,57 @@ class StairBlockRenderer(BlockRenderer):
 
     makeVertices = stairVertices
 
+class VineBlockRenderer(BlockRenderer):
+    blocktypes = [106]
+
+    SouthBit = 1 #FaceZIncreasing
+    WestBit = 2 #FaceXDecreasing
+    NorthBit = 4 #FaceZDecreasing
+    EastBit = 8 #FaceXIncreasing
+
+    renderstate = ChunkCalculator.renderstateVines
+
+    def vineFaceVertices(self, direction, blockIndices, exposedFaceIndices, blocks, blockData, blockLight, facingBlockLight, texMap):
+
+        bdata = blockData[blockIndices]
+        blockIndices = numpy.array(blockIndices)
+        if direction == pymclevel.faces.FaceZIncreasing:
+            blockIndices[blockIndices] = (bdata & 1).astype(bool)
+        elif direction == pymclevel.faces.FaceXDecreasing:
+            blockIndices[blockIndices] = (bdata & 2).astype(bool)
+        elif direction == pymclevel.faces.FaceZDecreasing:
+            blockIndices[blockIndices] = (bdata & 4).astype(bool)
+        elif direction == pymclevel.faces.FaceXIncreasing:
+            blockIndices[blockIndices] = (bdata & 8).astype(bool)
+        else:
+            return []
+        vertexArray = self.makeTemplate(direction, blockIndices)
+        if not len(vertexArray):
+            return vertexArray
+
+        vertexArray[_ST] += texMap(self.blocktypes[0], [0], direction)[:, numpy.newaxis, 0:2]
+
+        lights = blockLight[blockIndices][..., numpy.newaxis, numpy.newaxis]
+        vertexArray.view('uint8')[_RGB] *= lights
+
+        vertexArray.view('uint8')[_RGB] *= LeafBlockRenderer.leafColor
+
+        if direction == pymclevel.faces.FaceZIncreasing:
+            vertexArray[_XYZ][..., 2] -= 0.0625
+        if direction == pymclevel.faces.FaceXDecreasing:
+            vertexArray[_XYZ][..., 0] += 0.0625
+        if direction == pymclevel.faces.FaceZDecreasing:
+            vertexArray[_XYZ][..., 2] += 0.0625
+        if direction == pymclevel.faces.FaceXIncreasing:
+            vertexArray[_XYZ][..., 0] -= 0.0625
+
+        return vertexArray
+
+    makeFaceVertices = vineFaceVertices
+
 
 class SlabBlockRenderer(BlockRenderer):
-    slabID = 44
-    blocktypes = [slabID]
+    blocktypes = [44, 126]
 
     def slabFaceVertices(self, direction, blockIndices, exposedFaceIndices, blocks, blockData, blockLight, facingBlockLight, texMap):
         if direction != pymclevel.faces.FaceYIncreasing:
@@ -1854,12 +1924,14 @@ class SlabBlockRenderer(BlockRenderer):
 
         lights = facingBlockLight[blockIndices][..., numpy.newaxis, numpy.newaxis]
         bdata = blockData[blockIndices]
+        top = (bdata >> 3).astype(bool)
+        bdata &= 7
 
         vertexArray = self.makeTemplate(direction, blockIndices)
         if not len(vertexArray):
             return vertexArray
 
-        vertexArray[_ST] += texMap(self.slabID, bdata, direction)[:, numpy.newaxis, 0:2]
+        vertexArray[_ST] += texMap(blocks[blockIndices], bdata, direction)[:, numpy.newaxis, 0:2]
         vertexArray.view('uint8')[_RGB] *= lights
 
         if direction == pymclevel.faces.FaceYIncreasing:
@@ -1868,6 +1940,8 @@ class SlabBlockRenderer(BlockRenderer):
         if direction != pymclevel.faces.FaceYIncreasing and direction != pymclevel.faces.FaceYDecreasing:
             vertexArray[_XYZ][..., 2:4, 1] -= 0.5
             vertexArray[_ST][..., 2:4, 1] += 8
+
+        vertexArray[_XYZ][..., 1][top] += 0.5
 
         return vertexArray
 
@@ -2477,6 +2551,9 @@ class MCRenderer(object):
             return
 
         chunksDrawn = 0
+        if self.level.materials.name in ("Pocket", "Alpha"):
+            GL.glMatrixMode(GL.GL_TEXTURE)
+            GL.glScalef(1/2., 1/2., 1/2.)
 
         with gl.glPushMatrix(GL.GL_MODELVIEW):
             dx, dy, dz = self.origin
@@ -2512,6 +2589,10 @@ class MCRenderer(object):
             GL.glDisableClientState(GL.GL_TEXTURE_COORD_ARRAY)
                 # if self.drawLighting:
             self.drawLoadableChunkMarkers()
+
+        if self.level.materials.name in ("Pocket", "Alpha"):
+            GL.glMatrixMode(GL.GL_TEXTURE)
+            GL.glScalef(2., 2., 2.)
 
     renderErrorHandled = False
 

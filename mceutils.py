@@ -24,7 +24,6 @@ import config
 from cStringIO import StringIO
 from datetime import datetime
 import directories
-from errorreporting import reportException
 import httplib
 import mcplatform
 import numpy
@@ -47,10 +46,19 @@ def alertException(func):
             return func(*args, **kw)
         except root.Cancel:
             alert("Canceled.")
+        except pymclevel.infiniteworld.SessionLockLost as e:
+            alert(e.message + "\n\nYour changes cannot be saved.")
+
         except Exception, e:
             logging.exception("Exception:")
             if ask("Error during {0}: {1!r}".format(func, e)[:1000], ["Report Error", "Okay"], default=1, cancel=0) == "Report Error":
-                reportException()
+                try:
+                    import squash_python
+                    squash_python.get_client().recordException(*sys.exc_info())
+                except ImportError:
+                    pass
+                except Exception:
+                    logging.exception("Error while recording exception data:")
 
     return _alertException
 
@@ -265,110 +273,8 @@ def drawTerrainCuttingWire(box,
 
 def loadAlphaTerrainTexture():
     pngFile = None
-    customWaterFile = None
-    customLavaFile = None
-    grassColorFile = None
-    foliageColorFile = None
 
-    try:
-        skin = config.config.get("Settings", "MCEdit Skin")
-        if skin is None or skin == "[Current]":
-            optionsFile = os.path.join(mcplatform.minecraftDir, "options.txt")
-            for line in file(optionsFile):
-                if line.startswith("skin:"):
-                    skin = line[5:].strip('\n')
-
-        if skin and skin != "[Default]":
-            print "Loading texture pack {0}...".format(skin)
-            try:
-                if skin == "Default":
-                    pack = os.path.join(mcplatform.minecraftDir, "bin", "minecraft.jar")
-                    print "Loading textures from minecraft.jar"
-                else:
-                    pack = os.path.join(mcplatform.texturePacksDir, skin)
-                zf = zipfile.ZipFile(pack, "r")
-                pngFile = zf.open("terrain.png")
-                pngFile.nlSeps = []
-                if "custom_water_still.png" in zf.namelist():
-                    customWaterFile = zf.open("custom_water_still.png")
-                if "custom_lava_still.png" in zf.namelist():
-                    customLavaFile = zf.open("custom_lava_still.png")
-                if "misc/foliagecolor.png" in zf.namelist():
-                    foliageColorFile = zf.open("misc/foliagecolor.png")
-                if "misc/grasscolor.png" in zf.namelist():
-                    grassColorFile = zf.open("misc/grasscolor.png")
-                zf.close()
-
-            except Exception, e:
-                print repr(e), "while reading terrain.png from ", repr(pack)
-
-    except Exception, e:
-        print repr(e), "while loading texture pack info."
-
-    texW, texH, terraindata = loadPNGFile("terrain.png")
-
-    def slurpZipExt(zipextfile):
-        # zipextfile.read() doesn't read all available data
-        alldata = ""
-        data = zipextfile.read()
-        while len(data):
-            alldata += data
-            data = zipextfile.read()
-        return StringIO(alldata)
-
-    if pngFile is not None:
-        try:
-            texW, texH, terraindata = loadPNGData(slurpZipExt(pngFile))
-
-        except Exception, e:
-            print repr(e), "while loading texture pack"
-
-    if customWaterFile is not None:
-        s, t = pymclevel.materials.alphaMaterials.blockTextures[pymclevel.materials.alphaMaterials.Water.ID, 0, 0]
-        s = s * texW / 256
-        t = t * texH / 256
-
-        w, h, data = loadPNGData(slurpZipExt(customWaterFile))
-        if w == texW / 16:
-            # only handle the easy case for now
-            texdata = data[:w, :w]
-            terraindata[t:t + w, s:s + w] = texdata
-
-            # GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, s, t, w, w, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, texdata)
-    if customLavaFile is not None:
-        s, t = pymclevel.materials.alphaMaterials.blockTextures[pymclevel.materials.alphaMaterials.Lava.ID, 0, 0]
-        s = s * texW / 256
-        t = t * texH / 256
-
-        w, h, data = loadPNGData(slurpZipExt(customLavaFile))
-        if w == texW / 16:
-            # only handle the easy case for now
-            texdata = data[:w, :w]
-            terraindata[t:t + w, s:s + w] = texdata
-
-            # GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, s, t, w, w, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, texdata)
-
-    from renderer import LeafBlockRenderer
-    from renderer import GenericBlockRenderer
-    if foliageColorFile is not None:
-        w, h, data = loadPNGData(slurpZipExt(foliageColorFile))
-        color = data[77, 55, :3]
-        pymclevel.materials.alphaMaterials.flatColors[17, 0, :3] = color  # xxxxxxx
-
-        color = [c / 255.0 for c in color]
-        LeafBlockRenderer.leafColor = color
-    else:
-        LeafBlockRenderer.leafColor = LeafBlockRenderer.leafColorDefault
-
-    if grassColorFile is not None:
-        w, h, data = loadPNGData(slurpZipExt(grassColorFile))
-        color = data[77, 55, :3]
-        pymclevel.materials.alphaMaterials.flatColors[2, 0, :3] = color  # xxxxxxx
-        color = [c / 255.0 for c in color]
-
-        GenericBlockRenderer.grassColor = color
-    else:
-        GenericBlockRenderer.grassColor = GenericBlockRenderer.grassColorDefault
+    texW, texH, terraindata = loadPNGFile(os.path.join(directories.dataDir, "terrain.png"))
 
     def _loadFunc():
         loadTextureFunc(texW, texH, terraindata)
@@ -400,8 +306,6 @@ def loadPNGFile(filename):
     powers = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
     assert (w in powers) and (h in powers)  # how crude
 
-    ndata = numpy.array(data, dtype='uint8')
-
     return w, h, data
 
 
@@ -410,11 +314,12 @@ def loadTextureFunc(w, h, ndata):
     return w, h
 
 
-def loadPNGTexture(filename):
+def loadPNGTexture(filename, *a, **kw):
+    filename = os.path.join(directories.dataDir, filename)
     try:
         w, h, ndata = loadPNGFile(filename)
 
-        tex = glutils.Texture(functools.partial(loadTextureFunc, w, h, ndata))
+        tex = glutils.Texture(functools.partial(loadTextureFunc, w, h, ndata), *a, **kw)
         tex.data = ndata
         return tex
     except Exception, e:
@@ -506,7 +411,7 @@ class ChoiceButton(ValueButton):
     align = "c"
     choose = None
 
-    def __init__(self, choices, **kw):
+    def __init__(self, choices, scrolling=True, scroll_items=30, **kw):
         # passing an empty list of choices is ill-advised
 
         if 'choose' in kw:
@@ -514,6 +419,8 @@ class ChoiceButton(ValueButton):
 
         ValueButton.__init__(self, action=self.showMenu, **kw)
 
+        self.scrolling = scrolling
+        self.scroll_items = scroll_items
         self.choices = choices or ["[UNDEFINED]"]
 
         widths = [self.font.size(c)[0] for c in choices] + [self.width]
@@ -551,7 +458,8 @@ class ChoiceButton(ValueButton):
     @choices.setter
     def choices(self, ch):
         self._choices = ch
-        self.menu = Menu("", ((name, "pickMenu") for name in self._choices))
+        self.menu = Menu("", ((name, "pickMenu") for name in self._choices),
+                         self.scrolling, self.scroll_items)
 
 
 def CheckBoxLabel(title, *args, **kw):

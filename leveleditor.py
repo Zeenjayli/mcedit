@@ -11,6 +11,8 @@ ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
 WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."""
+import sys
+from compass import CompassOverlay
 from editortools.thumbview import ThumbView
 from pymclevel.infiniteworld import SessionLockLost
 
@@ -27,6 +29,7 @@ imported from editortools/
 
 import gc
 import os
+import math
 import csv
 import copy
 import time
@@ -53,7 +56,7 @@ from collections import defaultdict, deque
 from OpenGL import GL
 from OpenGL import GLU
 
-from albow import alert, ask, AttrRef, Button, Column, get_font, Grid, input_text, IntField, Menu, root, Row, TableColumn, TableView, TextField, TimeField, Widget
+from albow import alert, ask, AttrRef, Button, Column, get_font, Grid, input_text, IntField, Menu, root, Row, TableColumn, TableView, TextField, TimeField, Widget, CheckBox
 from albow.controls import Label, SmallValueDisplay, ValueDisplay
 from albow.dialogs import Dialog, QuickDialog, wrapped_label
 from albow.openglwidgets import GLOrtho, GLViewport
@@ -112,6 +115,8 @@ Settings.vsync = Settings("vertical sync", 0)
 Settings.visibilityCheck = Settings("visibility check", False)
 Settings.viewMode = Settings("View Mode", "Camera")
 
+Settings.undoLimit = Settings("Undo Limit", 20)
+
 ControlSettings = config.Settings("Controls")
 ControlSettings.mouseSpeed = ControlSettings("mouse speed", 5.0)
 ControlSettings.cameraAccel = ControlSettings("camera acceleration", 125.0)
@@ -141,21 +146,12 @@ class ControlPanel(Panel):
     def __init__(self, editor):
         Panel.__init__(self)
         self.editor = editor
-        self.size = editor.size
-        self.anchor = "rltb"
 
         self.bg_color = (0, 0, 0, 0.8)
 
         header = self.getHeader()
         keysColumn = [Label("")]
         buttonsColumn = [header]
-
-        '''def addRow(key, text, action):
-            b = Button(text, action=action, width = 300)
-            l = Label(key,width=100,margin=b.margin)
-            l.height=b.height
-            keysColumn.append(l)
-            buttonsColumn.append(b)'''
 
         cmd = mcplatform.cmd_name
         hotkeys = ([(cmd + "-N", "Create New World", editor.mcedit.createNewWorld),
@@ -166,7 +162,7 @@ class ControlPanel(Panel):
                     (cmd + "-W", "Close", editor.closeEditor),
                     ("", "", lambda: None),
 
-                    ("G", "Goto", editor.showGotoPanel),
+                    (cmd + "G", "Goto", editor.showGotoPanel),
                     (cmd + "-I", "World Info", editor.showWorldInfo),
                     (cmd + "-Z", "Undo", editor.undo),
                     (cmd + "-A", "Select All", editor.selectAll),
@@ -180,24 +176,20 @@ class ControlPanel(Panel):
 
         buttons = mceutils.HotkeyColumn(hotkeys, keysColumn, buttonsColumn)
 
-        # buttons.buttons[-1].ref =
-
-        self.add(buttons)
-        buttons.right = self.centerx
-        buttons.centery = self.centery
-        buttons.anchor = "wh"
-
         sideColumn = editor.mcedit.makeSideColumn()
-        sideColumn.centery = self.centery
-        sideColumn.left = self.centerx
-        sideColumn.anchor = "wh"
 
-        self.add(sideColumn)
-
+        self.add(Row([buttons, sideColumn]))
         self.shrink_wrap()
 
     def key_down(self, evt):
-        self.editor.key_down(evt)
+        if key.name(evt.key) == 'escape':
+            self.dismiss()
+        else:
+            self.editor.key_down(evt)
+
+    def mouse_down(self, e):
+        if e not in self:
+            self.dismiss()
 
 
 def unproject(x, y, z):
@@ -428,9 +420,9 @@ class CameraViewport(GLViewport):
             else:
                 return x
 
-        dx = -numpy.sin(numpy.radians(yaw)) * numpy.cos(numpy.radians(pitch))
-        dy = -numpy.sin(numpy.radians(pitch))
-        dz = numpy.cos(numpy.radians(yaw)) * numpy.cos(numpy.radians(pitch))
+        dx = -math.sin(math.radians(yaw)) * math.cos(math.radians(pitch))
+        dy = -math.sin(math.radians(pitch))
+        dz = math.cos(math.radians(yaw)) * math.cos(math.radians(pitch))
         return map(nanzero, [dx, dy, dz])
 
     def updateMouseVector(self):
@@ -530,7 +522,7 @@ class CameraViewport(GLViewport):
 
         try:
             block = self.editor.level.blockAt(*intProjectedPoint)
-        except pymclevel.ChunkNotPresent:
+        except (EnvironmentError, pymclevel.ChunkNotPresent):
             return intProjectedPoint, d
 
         if block == pymclevel.alphaMaterials.SnowLayer.ID:
@@ -543,7 +535,7 @@ class CameraViewport(GLViewport):
                     neighborBlock = self.editor.level.blockAt(*point)
                     if block != neighborBlock:
                         potentialOffsets.append(offsets)
-                except pymclevel.ChunkNotPresent:
+                except (EnvironmentError, pymclevel.ChunkNotPresent):
                     pass
 
         # check each component of the face vector to see if that face is exposed
@@ -876,8 +868,6 @@ class CameraViewport(GLViewport):
                             chunk.Entities.value = entities
                             chunk.dirty = True
 
-                        chunk.compress()
-
                         yield (i, self.editor.level.chunkCount)
                         i += 1
 
@@ -972,26 +962,26 @@ class CameraViewport(GLViewport):
             if point is not None:
                 point = map(lambda x: int(numpy.floor(x)), point)
                 if self.editor.currentTool is self.editor.selectionTool:
-                    block = self.editor.level.blockAt(*point)
-                    if distance2(point, self.cameraPosition) > 4:
-                        blockEditors = {
-                            pymclevel.alphaMaterials.MonsterSpawner.ID:   self.editMonsterSpawner,
-                            pymclevel.alphaMaterials.Sign.ID:             self.editSign,
-                            pymclevel.alphaMaterials.WallSign.ID:         self.editSign,
-                        }
-                        edit = blockEditors.get(block)
-                        if edit:
-                            self.editor.endSelection()
-                            edit(point)
-                        else:
-                            # detect "container" tiles
-                            try:
+                    try:
+                        block = self.editor.level.blockAt(*point)
+                        if distance2(point, self.cameraPosition) > 4:
+                            blockEditors = {
+                                pymclevel.alphaMaterials.MonsterSpawner.ID:   self.editMonsterSpawner,
+                                pymclevel.alphaMaterials.Sign.ID:             self.editSign,
+                                pymclevel.alphaMaterials.WallSign.ID:         self.editSign,
+                            }
+                            edit = blockEditors.get(block)
+                            if edit:
+                                self.editor.endSelection()
+                                edit(point)
+                            else:
+                                # detect "container" tiles
                                 te = self.editor.level.tileEntityAt(*point)
                                 if te and "Items" in te and "id" in te:
                                     self.editor.endSelection()
                                     self.editContainer(point, te["id"].value)
-                            except pymclevel.ChunkNotPresent:
-                                pass
+                    except (EnvironmentError, pymclevel.ChunkNotPresent):
+                        pass
 
     def leftClickUp(self, evt):
         self.editor.toolMouseUp(evt, self.blockFaceUnderCursor)
@@ -1003,7 +993,10 @@ class CameraViewport(GLViewport):
         logging.debug("Mouse down %d @ %s", button, evt.pos)
 
         if button == 1:
-            self.leftClickDown(evt)
+            if sys.platform == "darwin" and evt.ctrl:
+                self.rightClickDown(evt)
+            else:
+                self.leftClickDown(evt)
         elif button == 2:
             self.rightClickDown(evt)
         else:
@@ -1017,7 +1010,10 @@ class CameraViewport(GLViewport):
         button = remapMouseButton(evt.button)
         logging.debug("Mouse up   %d @ %s", button, evt.pos)
         if button == 1:
-            self.leftClickUp(evt)
+            if sys.platform == "darwin" and evt.ctrl:
+                self.rightClickUp(evt)
+            else:
+                self.leftClickUp(evt)
         elif button == 2:
             self.rightClickUp(evt)
         else:
@@ -1278,26 +1274,28 @@ class CameraViewport(GLViewport):
             self.drawCeiling()
 
         if self.editor.level:
-            self.updateBlockFaceUnderCursor()
+            try:
+                self.updateBlockFaceUnderCursor()
+            except (EnvironmentError, pymclevel.ChunkNotPresent) as e:
+                logging.debug("Updating cursor block: %s", e)
+                self.blockFaceUnderCursor = (None, None)
+
             root.get_root().update_tooltip()
 
             focusPair = self.blockFaceUnderCursor
-            if focusPair is not None:
 
-                # xxx whose job is it to check this stuff
-                (blockPosition, faceDirection) = focusPair
-                if None != blockPosition:
-                    self.editor.updateInspectionString(blockPosition)
-                    # for t in self.toolbar.tools:
+            (blockPosition, faceDirection) = focusPair
+            if None != blockPosition:
+                self.editor.updateInspectionString(blockPosition)
+                # for t in self.toolbar.tools:
 
-                    if self.find_widget(mouse.get_pos()) == self:
-                        ct = self.editor.currentTool
-                        if ct:
-                            if focusPair != None or self.mouseMovesCamera:
-                                ct.drawTerrainReticle()
-                                ct.drawToolReticle()
-                        else:
-                            self.editor.drawWireCubeReticle()
+                if self.find_widget(mouse.get_pos()) == self:
+                    ct = self.editor.currentTool
+                    if ct:
+                        ct.drawTerrainReticle()
+                        ct.drawToolReticle()
+                    else:
+                        self.editor.drawWireCubeReticle()
 
             for t in self.editor.toolbar.tools:
                 t.drawTerrainMarkers()
@@ -1307,6 +1305,18 @@ class CameraViewport(GLViewport):
         if self.drawFog:
             self.disableFog()
 
+        if self._compass is None:
+            self._compass = CompassOverlay()
+
+        self._compass.yawPitch = self.yaw, 0
+
+        with gl.glPushMatrix(GL.GL_PROJECTION):
+            GL.glLoadIdentity()
+            GL.glOrtho(0., 1., float(self.height) / self.width, 0, -200, 200)
+
+            self._compass.draw()
+
+    _compass = None
 
 class ChunkViewport(CameraViewport):
     defaultScale = 1.0  # pixels per block
@@ -1437,6 +1447,8 @@ class LevelEditor(GLViewport):
         self.generateStars()
 
         self.optionsBar = Widget()
+
+        mcEditButton = Button("MCEdit", action=self.showControls)
         viewDistanceDown = Button("<", action=self.decreaseViewDistance)
         viewDistanceUp = Button(">", action=self.increaseViewDistance)
         viewDistanceReadout = ValueDisplay(width=40, ref=AttrRef(self.renderer, "viewDistance"))
@@ -1491,8 +1503,10 @@ class LevelEditor(GLViewport):
         self.viewportButton = Button("Camera View", action=self.swapViewports,
             tooltipText="Shortcut: TAB")
 
-        row = (viewDistanceDown, Label("View Distance:"), viewDistanceReadout, viewDistanceUp,
-               readoutGrid, viewButton, self.viewportButton)
+        self.recordUndoButton = mceutils.CheckBoxLabel("Record Undo", ref=AttrRef(self, 'recordUndo'))
+
+        row = (mcEditButton, viewDistanceDown, Label("View Distance:"), viewDistanceReadout, viewDistanceUp,
+               readoutGrid, viewButton, self.viewportButton, self.recordUndoButton)
 
         # row += (Button("CR Info", action=self.showChunkRendererInfo), )
         row = Row(row)
@@ -1514,16 +1528,18 @@ class LevelEditor(GLViewport):
         self.viewportContainer.top = row.bottom
         self.viewportContainer.size = self.mainViewport.size
         self.add(self.viewportContainer)
+
         Settings.viewMode.addObserver(self)
+        Settings.undoLimit.addObserver(self)
 
         self.reloadToolbar()
 
         self.currentTool = None
         self.toolbar.selectTool(0)
 
-        self.controlPanel = controlPanel = ControlPanel(self)
-        controlPanel.anchor = "tlbr"
-        controlPanel.rect = self.rect
+        self.controlPanel = ControlPanel(self)
+        self.controlPanel.topleft = mcEditButton.bottomleft
+
 
     def __del__(self):
         self.deleteAllCopiedSchematics()
@@ -1654,7 +1670,7 @@ class LevelEditor(GLViewport):
     def analyzeBox(self, level, box):
         entityCounts = defaultdict(int)
         tileEntityCounts = defaultdict(int)
-        types = numpy.zeros(4096, dtype='uint32')
+        types = numpy.zeros(65536, dtype='uint32')
 
         def _analyzeBox():
             i = 0
@@ -1662,7 +1678,7 @@ class LevelEditor(GLViewport):
                 i += 1
                 yield i, box.chunkCount
                 blocks = numpy.array(chunk.Blocks[slices], dtype='uint16')
-                blocks |= (numpy.array(chunk.Data[slices], dtype='uint16') << 8)
+                blocks |= (numpy.array(chunk.Data[slices], dtype='uint16') << 12)
                 b = numpy.bincount(blocks.ravel())
                 types[:b.shape[0]] += b
 
@@ -1683,16 +1699,20 @@ class LevelEditor(GLViewport):
         tileEntitySum = numpy.sum(tileEntityCounts.values())
         presentTypes = types.nonzero()
 
-        blockCounts = sorted([(level.materials[t & 0xff, t >> 8], types[t]) for t in presentTypes[0]])
+        blockCounts = sorted([(level.materials[t & 0xfff, t >> 12], types[t]) for t in presentTypes[0]])
 
         counts = []
+
         c = 0
         b = level.materials.Air
         for block, count in blockCounts:
-            if b.name != block.name:
+            # Collapse waters and lavas together so different fluid levels are counted together
+            # xxx optional
+            if block.idStr not in ("water", "lava") or b.idStr != block.idStr:
                 counts.append((b, c))
                 b = block
                 c = 0
+
             c += count
         counts.append((b, c))
 
@@ -1947,6 +1967,7 @@ class LevelEditor(GLViewport):
 
         self.undoStack = []
         self.loadLevel(level)
+        self.recordUndo = True
         self.clearUnsavedEdits()
 
         self.renderer.position = self.currentViewport.cameraPosition
@@ -2086,14 +2107,18 @@ class LevelEditor(GLViewport):
                         return
 
                     if self.level == level:
-                        needsRefresh = [c.chunkPosition for c in level._loadedChunkData.itervalues() if c.dirty]
-                        needsRefresh.extend(level.unsavedWorkFolder.listChunks())
+                        if isinstance(level, pymclevel.MCInfdevOldLevel):
+                            needsRefresh = [c.chunkPosition for c in level._loadedChunkData.itervalues() if c.dirty]
+                            needsRefresh.extend(level.unsavedWorkFolder.listChunks())
+                        else:
+                            needsRefresh = [c for c in level.allChunks if level.getChunk(*c).dirty]
                         #xxx change MCInfdevOldLevel to monitor changes since last call
                         self.invalidateChunks(needsRefresh)
 
             self.freezeStatus("Saving...")
             self.level.saveInPlace()
 
+        self.recordUndo = True
         self.clearUnsavedEdits()
 
     def addUnsavedEdit(self):
@@ -2127,7 +2152,7 @@ class LevelEditor(GLViewport):
     def saveInfoLabelText(self):
         if self.unsavedEdits == 0:
             return ""
-        return "{0} unsaved edits.  CTRL-S to save.  ".format(self.unsavedEdits)
+        return "{0} unsaved edits.  CTRL-S to save.  {1}".format(self.unsavedEdits, "" if self.recordUndo else "(UNDO DISABLED)")
 
     @property
     def viewDistanceLabelText(self):
@@ -2498,6 +2523,8 @@ class LevelEditor(GLViewport):
                 self.closeEditor()
             if keyname == 'i':
                 self.showWorldInfo()
+            if keyname == 'g':
+                self.showGotoPanel()
 
             if keyname == 'e':
                 self.selectionTool.exportSelection()
@@ -2537,8 +2564,6 @@ class LevelEditor(GLViewport):
                     causeError()
 
         else:
-            if keyname == 'g':
-                self.showGotoPanel()
             if keyname == 'tab':
                 self.swapViewports()
 
@@ -2564,14 +2589,9 @@ class LevelEditor(GLViewport):
                 self.currentTool.swap()
 
             if keyname == 'escape':
-                if self.currentViewport == self.chunkViewport:
-                    self.toolbar.selectTool(8)
-                else:
-                    if self.currentTool != self.toolbar.tools[0]:
-                        self.toolbar.selectTool(-1)
-                    else:
-                        self.toolbar.tools[0].endSelection()
+                self.toolbar.tools[0].endSelection()
                 self.mouseLookOff()
+                self.showControls()
 
             # movement
             if keyname == config.config.get('Keys', 'Left'):
@@ -2671,10 +2691,14 @@ class LevelEditor(GLViewport):
 
     def closeEditor(self):
         if self.unsavedEdits:
-            if ask("Save unsaved edits before closing?", ["Don't Save", "Save"], default=-1, cancel=0) == "Save":
+            answer = ask("Save unsaved edits before closing?", ["Cancel", "Don't Save", "Save"], default=-1, cancel=0)
+            if answer == "Save":
                 self.saveFile()
-        self.unsavedEdits = 0
+            if answer == "Cancel":
+                return
 
+        self.unsavedEdits = 0
+        self.mainViewport.mouseLookOff()
         self.level = None
         self.renderer.stopWork()
         self.removeWorker(self.renderer)
@@ -2682,8 +2706,11 @@ class LevelEditor(GLViewport):
         self.mcedit.removeEditor()
 
     def repairRegions(self):
-        for rf in self.level.regionFiles.itervalues():
-            rf.repair()
+        worldFolder = self.level.worldFolder
+        for filename in worldFolder.findRegionFiles():
+            rf = worldFolder.tryLoadRegionFile(filename)
+            if rf:
+                rf.repair()
 
         alert("Repairs complete.  See the console window for details.")
 
@@ -2783,10 +2810,13 @@ class LevelEditor(GLViewport):
 
                 items.append(chunkCountLabel)
 
-            if hasattr(self.level, 'regionFiles') and len(self.level.regionFiles):
-                regionCount = len(self.level.regionFiles)
-                regionCountLabel = Label("Number of regions: {0}".format(regionCount))
-                items.append(regionCountLabel)
+
+            if hasattr(self.level, 'worldFolder'):
+                if hasattr(self.level.worldFolder, 'regionFiles'):
+                    worldFolder = self.level.worldFolder
+                    regionCount = len(worldFolder.regionFiles)
+                    regionCountLabel = Label("Number of regions: {0}".format(regionCount))
+                    items.append(regionCountLabel)
 
                 button = Button("Repair regions", action=self.repairRegions)
                 items.append(button)
@@ -2866,7 +2896,7 @@ class LevelEditor(GLViewport):
         worlds = []
         for f in worldFiles:
             try:
-                lev = pymclevel.MCInfdevOldLevel(f)
+                lev = pymclevel.MCInfdevOldLevel(f, readonly=True)
             except Exception:
                 continue
             else:
@@ -3129,10 +3159,6 @@ class LevelEditor(GLViewport):
         if not self.level:
             return
 
-        if key.get_mods() & (mcplatform.cmd_name is "Cmd" and KMOD_META or KMOD_CTRL):
-            self.showControls()
-        else:
-            self.hideControls()
         if not self.shouldLoadAndRender:
             return
 
@@ -3348,35 +3374,30 @@ class LevelEditor(GLViewport):
         self.currentTool.selectionChanged()
 
     def addOperation(self, op):
-        self.undoStack.append(op)
+        if self.recordUndo:
+            self.undoStack.append(op)
+            if len(self.undoStack) > self.undoLimit:
+                self.undoStack.pop(0)
+
+        self.performWithRetry(op)
+
+    recordUndo = True
+
+    def performWithRetry(self, op):
+        try:
+            op.perform(self.recordUndo)
+        except MemoryError:
+            self.invalidateAllChunks()
+            op.perform(self.recordUndo)
 
     def quit(self):
-        self.hideControls()
         self.mouseLookOff()
-        self.parent.confirm_quit()
+        self.mcedit.confirm_quit()
 
     mouseWasCaptured = False
 
     def showControls(self):
-        if self.controlPanel.parent:
-            return
-
-        controlPanel = self.controlPanel
-
-        controlPanel.size = self.size
-        self.add(self.controlPanel)
-        mouseWasCaptured = self.mainViewport.mouseMovesCamera
-        self.mouseLookOff()
-        self.mouseWasCaptured = mouseWasCaptured
-
-    def hideControls(self):
-        if None is self.controlPanel.parent:
-            return
-
-        if self.mouseWasCaptured and root.top_widget == root.get_root():
-            self.mouseLookOn()
-
-        self.controlPanel.set_parent(None)
+        self.controlPanel.present(False)
 
     infoPanel = None
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2.7
 # -*- coding: utf8 -*_
 """
 mcedit.py
@@ -8,7 +8,6 @@ Startup, main menu, keyboard configuration, automatic updating.
 import OpenGL
 import sys
 import os
-import errorreporting
 
 if "-debug" not in sys.argv:
     OpenGL.ERROR_CHECKING = False
@@ -17,6 +16,10 @@ import logging
 
 # Setup file and stderr logging.
 logger = logging.getLogger()
+
+# Set the log level up while importing OpenGL.GL to hide some obnoxious warnings about old array handlers
+logger.setLevel(logging.WARN)
+from OpenGL import GL
 logger.setLevel(logging.DEBUG)
 
 logfile = 'mcedit.log'
@@ -28,18 +31,30 @@ if hasattr(sys, 'frozen'):
         logfile = os.path.join(app.appdir, logfile)
     elif sys.platform == "darwin":
         logfile = os.path.expanduser("~/Library/Logs/" + logfile)
-        
+
 fh = logging.FileHandler(logfile, mode="w")
 fh.setLevel(logging.DEBUG)
 
 ch = logging.StreamHandler()
-if "-debug" in sys.argv:
-    ch.setLevel(logging.INFO)
-else:
-    ch.setLevel(logging.WARN)
+ch.setLevel(logging.WARN)
 
-fmt = logging.Formatter(
-    '[%(levelname)s][%(module)s.py:%(lineno)d]:%(message)s'
+if "-v" in sys.argv:
+    ch.setLevel(logging.INFO)
+if "-vv" in sys.argv:
+    ch.setLevel(logging.DEBUG)
+
+
+class FileLineFormatter(logging.Formatter):
+
+    def format(self, record):
+        record.__dict__['fileline'] = "%(module)s.py:%(lineno)d" % record.__dict__
+        record.__dict__['nameline'] = "%(name)s.py:%(lineno)d" % record.__dict__
+        return super(FileLineFormatter, self).format(record)
+
+
+
+fmt = FileLineFormatter(
+    '[%(levelname)8s][%(nameline)30s]:%(message)s'
 )
 fh.setFormatter(fmt)
 ch.setFormatter(fmt)
@@ -64,7 +79,6 @@ from mcplatform import platform_open
 import numpy
 
 
-from OpenGL import GL
 import os
 import os.path
 import pygame
@@ -126,7 +140,7 @@ class FileOpener(albow.Widget):
             shortname = os.path.basename(world)
             try:
                 if pymclevel.MCInfdevOldLevel.isLevel(world):
-                    lev = pymclevel.MCInfdevOldLevel(world)
+                    lev = pymclevel.MCInfdevOldLevel(world, readonly=True)
                     shortname = lev.LevelName
                     if lev.LevelName != lev.displayName:
                         shortname = u"{0} ({1})".format(lev.LevelName, lev.displayName)
@@ -384,23 +398,23 @@ class GraphicsPanel(Panel):
         Panel.__init__(self)
 
         self.mcedit = mcedit
-
-        def getPacks():
-            return ["[Default]", "[Current]"] + mcplatform.getTexturePacks()
-
-        def packChanged():
-            self.texturePack = self.texturePackChoice.selectedChoice
-            packs = getPacks()
-            if self.texturePack not in packs:
-                self.texturePack = "[Default]"
-            self.texturePackChoice.selectedChoice = self.texturePack
-            self.texturePackChoice.choices = packs
-
-        self.texturePackChoice = texturePackChoice = mceutils.ChoiceButton(getPacks(), choose=packChanged)
-        if self.texturePack in self.texturePackChoice.choices:
-            self.texturePackChoice.selectedChoice = self.texturePack
-
-        texturePackRow = albow.Row((albow.Label("Skin: "), texturePackChoice))
+#
+#        def getPacks():
+#            return ["[Default]", "[Current]"] + mcplatform.getTexturePacks()
+#
+#        def packChanged():
+#            self.texturePack = self.texturePackChoice.selectedChoice
+#            packs = getPacks()
+#            if self.texturePack not in packs:
+#                self.texturePack = "[Default]"
+#            self.texturePackChoice.selectedChoice = self.texturePack
+#            self.texturePackChoice.choices = packs
+#
+#        self.texturePackChoice = texturePackChoice = mceutils.ChoiceButton(getPacks(), choose=packChanged)
+#        if self.texturePack in self.texturePackChoice.choices:
+#            self.texturePackChoice.selectedChoice = self.texturePack
+#
+#        texturePackRow = albow.Row((albow.Label("Skin: "), texturePackChoice))
 
         fieldOfViewRow = mceutils.FloatInputRow("Field of View: ",
             ref=Settings.fov.propertyRef(), width=100, min=25, max=120)
@@ -426,7 +440,7 @@ class GraphicsPanel(Panel):
         settingsColumn = albow.Column((fastLeavesRow,
                                   roughGraphicsRow,
                                   enableMouseLagRow,
-                                  texturePackRow,
+#                                  texturePackRow,
                                   fieldOfViewRow,
                                   targetFPSRow,
                                   bufferLimitRow,
@@ -479,6 +493,9 @@ class OptionsPanel(Dialog):
         mouseSpeedRow = mceutils.FloatInputRow("Mouse Speed: ",
             ref=ControlSettings.mouseSpeed.propertyRef(), width=100, min=0.1, max=20.0)
 
+        undoLimitRow = mceutils.IntInputRow("Undo Limit: ",
+            ref=Settings.undoLimit.propertyRef(), width=100, min=0)
+
         invertRow = mceutils.CheckBoxLabel("Invert Mouse",
             ref=ControlSettings.invertMousePitch.propertyRef(),
             tooltipText="Reverse the up and down motion of the mouse.")
@@ -528,6 +545,7 @@ class OptionsPanel(Dialog):
             cameraBrakeSpeedRow,
             blockBufferRow,
             mouseSpeedRow,
+            undoLimitRow,
         )
 
         options = (
@@ -879,10 +897,9 @@ class MCEdit(GLViewport):
             # We're being run from a bundle, check for updates.
             import esky
 
-            # We shouldn't be using Github for this.
             app = esky.Esky(
-                sys.executable,
-                'https://github.com/mcedit/mcedit/downloads'
+                sys.executable.decode(sys.getfilesystemencoding()),
+                'https://bitbucket.org/codewarrior0/mcedit/downloads'
             )
             try:
                 update_version = app.find_update()
@@ -906,17 +923,15 @@ class MCEdit(GLViewport):
                     def callback(args):
                         status = args['status']
                         status_texts = {
-                            'searching': "Finding updates...",
-                            'found':  "Found version {new_version}",
-                            'downloading': "Downloading: {received} / {size}",
-                            'ready': "Downloaded {path}",
-                            'installing': "Installing {new_version}",
-                            'cleaning up': "Cleaning up...",
-                            'done': "Done."
+                            'searching': u"Finding updates...",
+                            'found':  u"Found version {new_version}",
+                            'downloading': u"Downloading: {received} / {size}",
+                            'ready': u"Downloaded {path}",
+                            'installing': u"Installing {new_version}",
+                            'cleaning up': u"Cleaning up...",
+                            'done': u"Done."
                         }
                         text = status_texts.get(status, 'Unknown').format(**args)
-                        if status != 'downloding':
-                            print args
 
                         panel = Dialog()
                         panel.idleevent = lambda event: panel.dismiss()
@@ -927,16 +942,14 @@ class MCEdit(GLViewport):
 
                     try:
                         app.auto_update(callback)
-                    except esky.EskyVersionError:
+                    except (esky.EskyVersionError, EnvironmentError):
                         albow.alert("Failed to install update %s" % update_version)
                     else:
                         albow.alert("Version %s installed. Restart MCEdit to begin using it." % update_version)
                         raise SystemExit()
 
         if mcedit.closeMinecraftWarning:
-            answer = albow.ask("Warning: You must close Minecraft completely before editing. Save corruption may result. Get Satisfaction to learn more.", ["Get Satisfaction", "Don't remind me again.", "OK"], default=1, cancel=1)
-            if answer == "Get Satisfaction":
-                mcplatform.platform_open("http://getsatisfaction.com/mojang/topics/region_file_cache_interferes_with_map_editors_risking_save_corruption")
+            answer = albow.ask("Warning: Only open a world in one program at a time. If you open a world at the same time in MCEdit and in Minecraft, you will lose your work and possibly damage your save file.\n\n If you are using Minecraft 1.3 or earlier, you need to close Minecraft completely before you use MCEdit.", ["Don't remind me again.", "OK"], default=1, cancel=1)
             if answer == "Don't remind me again.":
                 mcedit.closeMinecraftWarning = False
 
@@ -954,6 +967,8 @@ class MCEdit(GLViewport):
             Settings.reportCrashesAsked.set(True)
 
         config.saveConfig()
+        if "-causeError" in sys.argv:
+            raise ValueError, "Error requested via -causeError"
 
         while True:
             try:
@@ -986,6 +1001,29 @@ def main(argv):
     Setup display, bundled schematics. Handle unclean
     shutdowns.
     """
+    try:
+        import squash_python
+        squash_python.uploader.SquashUploader.headers.pop("Content-encoding", None)
+        squash_python.uploader.SquashUploader.headers.pop("Accept-encoding", None)
+
+        version = release.get_version()
+        client = squash_python.get_client()
+        client.APIKey = "6ea52b17-ac76-4fd8-8db4-2d7303473ca2"
+        client.environment = "testing" if "build" in version else "production"
+        client.host = "http://bugs.mcedit.net"
+        client.notifyPath = "/bugs.php"
+        client.revision = release.get_commit()
+        client.build = version
+        client.timeout = 5
+        client.disabled = not config.config.getboolean("Settings", "report crashes new")
+        def _reportingChanged(val):
+            client.disabled = not val
+
+        Settings.reportCrashes.addObserver(client, '_enabled', _reportingChanged)
+        client.reportErrors()
+        client.hook()
+    except (ImportError, UnicodeError) as e:
+        pass
 
     try:
         display.init()
@@ -1014,13 +1052,16 @@ def main(argv):
 
     try:
         MCEdit.main()
-    except SystemExit:
-        return 0
-    except Exception, e:
-        logging.error('An unhandled error occured.', exc_info=True)
-        errorreporting.reportException()
+    except Exception as e:
+        logging.error("MCEdit version %s", release.get_version())
         display.quit()
-        return 1
+        if hasattr(sys, 'frozen') and sys.platform == 'win32':
+            logging.exception("%s", e)
+            print "Press RETURN or close this window to dismiss."
+            raw_input()
+
+        raise
+
     return 0
 
 
